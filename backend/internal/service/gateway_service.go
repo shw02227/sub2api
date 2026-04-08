@@ -3714,11 +3714,133 @@ func injectClaudeCodePrompt(body []byte, system any) []byte {
 	return result
 }
 
+
+// stripAssistantPrefill removes ALL trailing assistant messages,
+// because Anthropic OAuth accounts don't support assistant message prefill.
+func stripAssistantPrefill(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+	arr := messages.Array()
+	if len(arr) == 0 {
+		return body
+	}
+	// Find the last non-assistant message index
+	keepCount := len(arr)
+	for keepCount > 0 && arr[keepCount-1].Get("role").String() == "assistant" {
+		keepCount--
+	}
+	if keepCount == len(arr) {
+		return body // no trailing assistant messages
+	}
+	if keepCount == 0 {
+		return body // all messages are assistant, don't strip everything
+	}
+	var kept [][]byte
+	for i := 0; i < keepCount; i++ {
+		kept = append(kept, []byte(arr[i].Raw))
+	}
+	if out, ok := setJSONRawBytes(body, "messages", buildJSONArrayRaw(kept)); ok {
+		stripped := len(arr) - keepCount
+		logger.LegacyPrintf("service.gateway", "[PrefillStrip] Removed %d trailing assistant message(s) (had %d messages, now %d)", stripped, len(arr), keepCount)
+		return out
+	}
+	return body
+}
+
 // rewriteSystemForNonClaudeCode 将非 Claude Code 客户端的 system prompt 迁移至 messages，
 // system 字段仅保留 Claude Code 标识提示词。
 // Anthropic 基于 system 参数内容检测第三方应用，仅前置追加 Claude Code 提示词
 // 无法通过检测，因为后续内容仍为非 Claude Code 格式。
 // 策略：将原始 system prompt 提取并注入为 user/assistant 消息对，system 仅保留 Claude Code 标识。
+
+// toPascalCase converts snake_case or lowercase tool names to PascalCase.
+// "sessions_list" -> "SessionsList", "read" -> "Read", "tts" -> "Tts"
+func toPascalCase(s string) string {
+	parts := strings.Split(s, "_")
+	var result strings.Builder
+	for _, part := range parts {
+		if len(part) > 0 {
+			result.WriteString(strings.ToUpper(part[:1]))
+			if len(part) > 1 {
+				result.WriteString(part[1:])
+			}
+		}
+	}
+	return result.String()
+}
+
+// rewriteToolNamesForClaudeCode converts tool names to PascalCase to pass
+// Anthropic's Claude Code client detection (which rejects lowercase tool names
+// when >12 tools are present). Returns modified body and a reverse mapping.
+func rewriteToolNamesForClaudeCode(body []byte) ([]byte, map[string]string) {
+	reverseMap := make(map[string]string) // PascalCase -> original
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return body, reverseMap
+	}
+
+	needsRewrite := false
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		name := tool.Get("name").String()
+		pascal := toPascalCase(name)
+		if pascal != name {
+			needsRewrite = true
+			return false
+		}
+		return true
+	})
+	if !needsRewrite {
+		return body, reverseMap
+	}
+
+	var newTools [][]byte
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		name := tool.Get("name").String()
+		pascal := toPascalCase(name)
+		if pascal != name {
+			reverseMap[pascal] = name
+			// Replace the name field in this tool's JSON
+			toolBytes := []byte(tool.Raw)
+			if modified, ok := setJSONValueBytes(toolBytes, "name", pascal); ok {
+				newTools = append(newTools, modified)
+			} else {
+				newTools = append(newTools, toolBytes)
+			}
+		} else {
+			newTools = append(newTools, []byte(tool.Raw))
+		}
+		return true
+	})
+
+	if out, ok := setJSONRawBytes(body, "tools", buildJSONArrayRaw(newTools)); ok {
+		logger.LegacyPrintf("service.gateway", "[ToolRewrite] Renamed %d tools to PascalCase", len(reverseMap))
+		return out, reverseMap
+	}
+	return body, reverseMap
+}
+
+// reverseToolNameInResponse converts PascalCase tool names back to original names
+// in a streaming response chunk (for tool_use content blocks).
+func reverseToolNameInResponse(chunk []byte, reverseMap map[string]string) []byte {
+	if len(reverseMap) == 0 {
+		return chunk
+	}
+	// Check if this chunk contains a tool_use name
+	nameResult := gjson.GetBytes(chunk, "content_block.name")
+	if !nameResult.Exists() {
+		return chunk
+	}
+	pascalName := nameResult.String()
+	if original, ok := reverseMap[pascalName]; ok {
+		if modified, setOK := setJSONValueBytes(chunk, "content_block.name", original); setOK {
+			return modified
+		}
+	}
+	return chunk
+}
+
 func rewriteSystemForNonClaudeCode(body []byte, system any) []byte {
 	system = normalizeSystemParam(system)
 
@@ -3975,12 +4097,19 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	isClaudeCode := isClaudeCodeRequest(ctx, c, parsed)
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
 
+	var toolNameReverseMap map[string]string
+	_ = toolNameReverseMap // used below via gin context
 	if shouldMimicClaudeCode {
 		// 非 Claude Code 客户端：将 system 替换为 Claude Code 标识，原始 system 迁移至 messages
 		// 条件：1) OAuth/SetupToken 账号  2) 不是 Claude Code 客户端  3) 不是 Haiku 模型  4) system 中还没有 Claude Code 提示词
 		if !strings.Contains(strings.ToLower(reqModel), "haiku") &&
-			!systemIncludesClaudeCodePrompt(parsed.System) {
+true {  // PATCHED: always rewrite, ignore systemIncludesClaudeCodePrompt
 			body = rewriteSystemForNonClaudeCode(body, parsed.System)
+			// Also rewrite tool names to PascalCase to pass Anthropic's detection
+			body, toolNameReverseMap = rewriteToolNamesForClaudeCode(body)
+			if len(toolNameReverseMap) > 0 {
+				c.Set("toolNameReverseMap", toolNameReverseMap)
+			}
 		}
 
 		normalizeOpts := claudeOAuthNormalizeOptions{stripSystemCacheControl: true}
@@ -4003,6 +4132,11 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 
 	// 强制执行 cache_control 块数量限制（最多 4 个）
 	body = enforceCacheControlLimit(body)
+
+	// Strip assistant message prefill for OAuth accounts (not supported)
+	if shouldMimicClaudeCode {
+		body = stripAssistantPrefill(body)
+	}
 
 	// 应用模型映射：
 	// - APIKey 账号：使用账号级别的显式映射（如果配置），否则透传原始模型名
@@ -4066,6 +4200,35 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		if err != nil {
 			return nil, err
 		}
+
+		// [DEBUG-BODY] Dump final upstream request headers and body
+		if shouldMimicClaudeCode && attempt == 1 {
+			clientUA := ""
+			if c != nil && c.Request != nil {
+				clientUA = c.GetHeader("User-Agent")
+			}
+			hdrs := make([]string, 0, len(upstreamReq.Header))
+			for k, v := range upstreamReq.Header {
+				hdrs = append(hdrs, k+"="+strings.Join(v, ","))
+			}
+			sort.Strings(hdrs)
+			logger.LegacyPrintf("service.gateway", "[DEBUG-BODY] ClientUA=%s FinalHeaders: %s", clientUA, strings.Join(hdrs, " | "))
+			// Dump key fields
+			sysField := gjson.GetBytes(body, "system").String()
+			if len(sysField) > 200 { sysField = sysField[:200] }
+			toolsCount := gjson.GetBytes(body, "tools.#").Int()
+			thinkingRaw := gjson.GetBytes(body, "thinking").Raw
+			metadataRaw := gjson.GetBytes(body, "metadata").Raw
+			maxTokensRaw := gjson.GetBytes(body, "max_tokens").Raw
+			streamRaw := gjson.GetBytes(body, "stream").Raw
+			msgsCount := gjson.GetBytes(body, "messages.#").Int()
+			bodyTail := ""
+			if len(body) > 500 { bodyTail = string(body[len(body)-500:]) } else { bodyTail = string(body) }
+			bodyTail = strings.ReplaceAll(strings.ReplaceAll(bodyTail, "\n", " "), "\r", " ")
+			logger.LegacyPrintf("service.gateway", "[DEBUG-FIELDS] ClientUA=%s system=%s tools=%d msgs=%d thinking=%s metadata=%s max_tokens=%s stream=%s", clientUA, sysField, toolsCount, msgsCount, thinkingRaw, metadataRaw, maxTokensRaw, streamRaw)
+			logger.LegacyPrintf("service.gateway", "[DEBUG-TAIL] ClientUA=%s BodyTail500: %s", clientUA, bodyTail)
+		}
+
 
 		// 发送请求
 		resp, err = s.httpUpstream.DoWithTLS(upstreamReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
@@ -4937,6 +5100,16 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 			}
 
 			if !clientDisconnected {
+				// Reverse tool name mapping for non-Claude-Code clients
+				if reverseMap, exists := c.Get("toolNameReverseMap"); exists {
+					if m, ok := reverseMap.(map[string]string); ok && len(m) > 0 {
+						if strings.Contains(line, "tool_use") {
+							for pascal, original := range m {
+								line = strings.Replace(line, `"name":"`+pascal+`"`, `"name":"`+original+`"`, 1)
+							}
+						}
+					}
+				}
 				if _, err := io.WriteString(w, line); err != nil {
 					clientDisconnected = true
 					logger.LegacyPrintf("service.gateway", "[Anthropic passthrough] Client disconnected during streaming, continue draining upstream for usage: account=%d", account.ID)

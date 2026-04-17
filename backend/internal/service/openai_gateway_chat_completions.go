@@ -244,6 +244,7 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 
 	var finalResponse *apicompat.ResponsesResponse
 	var usage OpenAIUsage
+	var accumulatedText strings.Builder
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -259,6 +260,10 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 				zap.String("request_id", requestID),
 			)
 			continue
+		}
+
+		if event.Type == "response.output_text.delta" && event.Delta != "" {
+			accumulatedText.WriteString(event.Delta)
 		}
 
 		if (event.Type == "response.completed" || event.Type == "response.incomplete" || event.Type == "response.failed") &&
@@ -290,6 +295,33 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 		return nil, fmt.Errorf("upstream stream ended without terminal event")
 	}
 
+	// If the completed event has empty output (gpt-5.4 sends content via delta events only),
+	// reconstruct output from accumulated delta text
+	if accumulatedText.Len() > 0 {
+		hasContent := false
+		for _, item := range finalResponse.Output {
+			if item.Type == "message" {
+				for _, part := range item.Content {
+					if part.Type == "output_text" && part.Text != "" {
+						hasContent = true
+						break
+					}
+				}
+			}
+			if hasContent {
+				break
+			}
+		}
+		if !hasContent {
+			finalResponse.Output = append(finalResponse.Output, apicompat.ResponsesOutput{
+				Type: "message",
+				Role: "assistant",
+				Content: []apicompat.ResponsesContentPart{
+					{Type: "output_text", Text: accumulatedText.String()},
+				},
+			})
+		}
+	}
 	chatResp := apicompat.ResponsesToChatCompletions(finalResponse, originalModel)
 
 	if s.responseHeaderFilter != nil {
